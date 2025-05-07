@@ -1,6 +1,8 @@
-yfinance==0.2.36
-pandas==2.2.0
-plotly==5.18.0
+pandas>=1.5.0
+plotly>=5.13.0
+yfinance>=0.2.18
+pandas_market_calendars>=4.1.1
 fastapi==0.109.2
 uvicorn==0.27.1
-python-dotenv==1.0.1 
+python-dotenv==1.0.1
+numpy==1.24.3 
