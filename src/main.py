@@ -5,9 +5,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import pandas_market_calendars as mcal
+import psycopg2
+from psycopg2.extras import execute_values
+from typing import Optional, List, Dict
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class StockAnalyzer:
-    def __init__(self):
+    def __init__(self, db_config: Optional[Dict[str, str]] = None):
         self.data = None
         self.exchange_suffixes = {
             'NSE': '.NS',
@@ -16,6 +24,82 @@ class StockAnalyzer:
         # Initialize market calendars
         self.nse_calendar = mcal.get_calendar('NSE')
         self.bse_calendar = mcal.get_calendar('BSE')
+        
+        # Database configuration
+        self.db_config = db_config or {
+            'dbname': os.getenv('DB_NAME', 'Market_DataBase_25'),
+            'user': os.getenv('DB_USER', 'postgres'),
+            'password': os.getenv('DB_PASSWORD', 'rootroot'),
+            'host': os.getenv('DB_HOST', 'localhost'),
+            'port': os.getenv('DB_PORT', '5432')
+        }
+        
+        # Initialize database
+        self._init_database()
+
+    def _init_database(self):
+        """Initialize database connection and create necessary tables"""
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            with conn.cursor() as cur:
+                # Check if stockCallActuals table exists
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'stockCallActuals'
+                    );
+                """)
+                table_exists = cur.fetchone()[0]
+                
+                if not table_exists:
+                    logger.info("Creating stockCallActuals table...")
+                    cur.execute("""
+                        CREATE TABLE "stockCallActuals" (
+                            id SERIAL PRIMARY KEY,
+                            stock_call_id INTEGER NOT NULL,
+                            openPrice DECIMAL(10,2) NOT NULL,
+                            closePrice DECIMAL(10,2) NOT NULL,
+                            highPrice DECIMAL(10,2) NOT NULL,
+                            lowPrice DECIMAL(10,2) NOT NULL,
+                            recordDate DATE NOT NULL,
+                            hitOrMiss VARCHAR(10) DEFAULT 'HIT',
+                            hitOrMissReason TEXT,
+                            active BOOLEAN DEFAULT TRUE,
+                            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE(stock_call_id, recordDate)
+                        );
+                    """)
+                else:
+                    # Check if unique constraint exists
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conrelid = 'stockCallActuals'::regclass
+                            AND conname = 'stockcallactuals_stock_call_id_recorddate_key'
+                        );
+                    """)
+                    constraint_exists = cur.fetchone()[0]
+                    
+                    if not constraint_exists:
+                        logger.info("Adding unique constraint to stockCallActuals table...")
+                        cur.execute("""
+                            ALTER TABLE "stockCallActuals"
+                            ADD CONSTRAINT stockcallactuals_stock_call_id_recorddate_key
+                            UNIQUE (stock_call_id, recordDate);
+                        """)
+                
+                conn.commit()
+                logger.info("Database initialization completed successfully")
+                
+        except Exception as e:
+            logger.error(f"Error initializing database: {str(e)}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
 
     def validate_symbol(self, symbol: str) -> bool:
         """Validate if a stock symbol exists"""
@@ -322,12 +406,12 @@ class StockAnalyzer:
             # Structure the data in a format suitable for database storage
             db_data = {
                 'stock_name': stock_data['stock_name'],  # Stock identifier
-                'record_date': prev_business_day.strftime('%Y-%m-%d'),  # Previous business day in YYYY-MM-DD format
                 'open_price': stock_data['previous_business_day_data']['open'],  # Opening price
+                'close_price': stock_data['previous_business_day_data']['close'], # Closing price
                 'high_price': stock_data['previous_business_day_data']['high'],  # Highest price
                 'low_price': stock_data['previous_business_day_data']['low'],    # Lowest price
-                'close_price': stock_data['previous_business_day_data']['close'], # Closing price
-                'volume': stock_data['previous_business_day_data']['volume'],     # Trading volume
+                'record_date': prev_business_day.strftime('%Y-%m-%d'),  # Previous business day in YYYY-MM-DD format
+               # 'volume': stock_data['previous_business_day_data']['volume'],     # Trading volume
                 'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')       # Current timestamp
             }
             
@@ -356,6 +440,159 @@ class StockAnalyzer:
             # Catch any unexpected errors and provide meaningful error message
             print(f"Error preparing data for database: {str(e)}")
             return None
+
+    def get_stock_call_id(self, stock_name: str) -> Optional[int]:
+        """
+        Get the stock_call_id from stockCalls table for a given stock name
+        
+        Args:
+            stock_name (str): Stock name (e.g., 'RELIANCE')
+            
+        Returns:
+            Optional[int]: stock_call_id if found, None otherwise
+        """
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM stockCalls 
+                    WHERE stockName = %s AND active = TRUE
+                    ORDER BY createdAt DESC LIMIT 1
+                """, (stock_name,))
+                result = cur.fetchone()
+                return result[0] if result else None
+        except Exception as e:
+            logger.error(f"Error getting stock_call_id: {str(e)}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def store_historical_data(self, stock_name: str, start_date: str, end_date: str) -> bool:
+        """
+        Store historical stock data in stockCallActuals table for the given date range
+        
+        Args:
+            stock_name (str): Stock name (e.g., 'RELIANCE')
+            start_date (str): Start date in YYYY-MM-DD format
+            end_date (str): End date in YYYY-MM-DD format
+            
+        Returns:
+            bool: True if data was stored successfully, False otherwise
+        """
+        try:
+            # Validate dates
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            today = datetime.now()
+            
+            if start_dt > today or end_dt > today:
+                logger.error("Cannot fetch data for future dates")
+                return False
+            
+            logger.info(f"Attempting to store data for {stock_name} from {start_date} to {end_date}")
+            
+            # Get stock_call_id first
+            stock_call_id = self.get_stock_call_id(stock_name)
+            if not stock_call_id:
+                logger.error(f"No active stock call found for {stock_name}")
+                return False
+            
+            logger.info(f"Found stock_call_id: {stock_call_id}")
+            
+            # Add exchange suffix to stock name for fetching data
+            symbol = f"{stock_name}.NS"  # Default to NSE
+            
+            # Fetch historical data
+            logger.info("Fetching stock data...")
+            data = self.get_stock_data(symbol, start_date, end_date)
+            if data.empty:
+                logger.error(f"No data available for {stock_name} between {start_date} and {end_date}")
+                return False
+            
+            # Prepare data for database insertion
+            records = []
+            for date, row in data.iterrows():
+                # Calculate hit_or_miss based on your business logic
+                # This is a placeholder - you'll need to implement your actual logic
+                hit_or_miss = 'HIT'  # or 'MISS' based on your criteria
+                hit_or_miss_reason = None  # Add your reason if needed
+                
+                record = (
+                    stock_call_id,
+                    float(row['Open'].item()),
+                    float(row['Close'].item()),
+                    float(row['High'].item()),
+                    float(row['Low'].item()),
+                    date.strftime('%Y-%m-%d'),
+                    hit_or_miss,
+                    hit_or_miss_reason,
+                    True,  # active
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # created_at
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')   # updated_at
+                )
+                records.append(record)
+            
+            logger.info(f"Preparing to store {len(records)} records in database...")
+
+            # Connect to database and insert data
+            try:
+                conn = psycopg2.connect(**self.db_config)
+                with conn.cursor() as cur:
+                    # First, check the actual table structure
+                    cur.execute("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'stockCallActuals'
+                        ORDER BY ordinal_position
+                    """)
+                    columns = [col[0] for col in cur.fetchall()]
+                    logger.info(f"Table columns: {columns}")
+                    
+                    # Check if unique constraint exists
+                    cur.execute("""
+                        SELECT conname, pg_get_constraintdef(oid) 
+                        FROM pg_constraint 
+                        WHERE conrelid = 'stockCallActuals'::regclass 
+                        AND contype = 'u'
+                    """)
+                    constraints = cur.fetchall()
+                    logger.info(f"Unique constraints: {constraints}")
+                    
+                    # Use execute_values for efficient bulk insertion
+                    execute_values(cur, """
+                        INSERT INTO stockCallActuals 
+                        (stock_call_id, open_price, close_price, high_price, low_price, 
+                        record_date, hit_or_miss, hit_or_miss_reason, active, created_at, updated_at)
+                        VALUES %s
+                        ON CONFLICT (stock_call_id, record_date) 
+                        DO UPDATE SET
+                            open_price = EXCLUDED.open_price,
+                            close_price = EXCLUDED.close_price,
+                            high_price = EXCLUDED.high_price,
+                            low_price = EXCLUDED.low_price,
+                            hit_or_miss = EXCLUDED.hit_or_miss,
+                            hit_or_miss_reason = EXCLUDED.hit_or_miss_reason,
+                            active = EXCLUDED.active,
+                            updated_at = EXCLUDED.updated_at
+                    """, records)
+                
+                conn.commit()
+                logger.info(f"Successfully stored {len(records)} records for {stock_name}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Error during database operation: {str(e)}")
+                if conn:
+                    conn.rollback()
+                return False
+            finally:
+                if conn:
+                    conn.close()
+
+        except Exception as e:
+            logger.error(f"Unexpected error storing historical data for {stock_name}: {str(e)}")
+            return False
 
 def get_date_range() -> tuple:
     """Get date range from user input"""
@@ -406,96 +643,126 @@ def main():
     
     while True:
         print("\n=== Stock Market Analysis Tool ===")
+        print("\n1. Analyze Stock Data")
+        print("2. Store Historical Data")
+        print("3. Exit")
         
-        # Get exchange
-        print("\nSelect Exchange:")
-        print("1. NSE (National Stock Exchange)")
-        print("2. BSE (Bombay Stock Exchange)")
+        choice = input("\nEnter your choice (1-3): ")
         
-        exchange_map = {'1': 'NSE', '2': 'BSE'}
-        exchange_choice = input("\nEnter choice (1-2): ")
-        exchange = exchange_map.get(exchange_choice, 'NSE')
-        suffix = analyzer.exchange_suffixes[exchange]
-        
-        # Get stock symbols
-        symbols_input = input("\nEnter stock symbols (comma-separated, e.g., RELIANCE,TCS,HDFCBANK): ")
-        symbols = [s.strip().upper() + suffix for s in symbols_input.split(',') if s.strip()]
-        
-        # Validate symbols
-        valid_symbols = []
-        print("\nValidating symbols...")
-        for symbol in symbols:
-            if analyzer.validate_symbol(symbol):
-                valid_symbols.append(symbol)
-                print(f"✓ {symbol} is valid")
-            else:
-                print(f"✗ {symbol} is not valid")
-        
-        if not valid_symbols:
-            print("\nNo valid symbols found!")
-            if input("\nTry again? (y/n): ").lower() != 'y':
-                break
-            continue
-        
-        # Get date range
-        start_date, end_date = get_date_range()
-        
-        # Fetch and analyze data
-        print(f"\nFetching data from {start_date} to {end_date}...")
-        
-        for symbol in valid_symbols:
-            try:
-                # Get data
-                data = analyzer.get_stock_data(symbol, start_date, end_date)
-                if data.empty:
-                    print(f"\nNo data available for {symbol}")
-                    continue
-                
-                # Calculate statistics
-                stats = analyzer.calculate_statistics(data, exchange)
-                
-                # Display results
-                print(f"\n{'=' * 50}")
-                print(f"Analysis for {symbol}")
-                print(f"{'=' * 50}")
-                print(f"Current Price: ₹{stats['current_price']}")
-                print(f"Previous Close: ₹{stats['previous_close']}")
-                print(f"\nToday's Trading:")
-                print(f"Open: ₹{stats['open']}")
-                print(f"High: ₹{stats['high']}")
-                print(f"Low: ₹{stats['low']}")
-                print(f"Volume: {stats['volume']:,}")
-                print(f"\nPrevious Business Day ({stats['prev_date']}):")
-                print(f"Open: ₹{stats['prev_open']}")
-                print(f"High: ₹{stats['prev_high']}")
-                print(f"Low: ₹{stats['prev_low']}")
-                print(f"Close: ₹{stats['prev_close']}")
-                print(f"Volume: {stats['prev_volume']:,}")
-                print(f"\nPerformance:")
-                print(f"Daily Return: {stats['daily_return']}%")
-                print(f"Total Return: {stats['total_return']}%")
-                print(f"Volatility: {stats['volatility']}%")
-                print(f"\nPeriod Statistics ({start_date} to {end_date}):")
-                print(f"Highest Price: ₹{stats['period_high']}")
-                print(f"Lowest Price: ₹{stats['period_low']}")
-                print(f"Average Daily Volume: {stats['avg_volume']:,}")
-                
-                # Display database-ready data
-                print(f"\n{'=' * 50}")
-                print(f"Database-Ready Data for {symbol}")
-                print(f"{'=' * 50}")
-                db_data = analyzer.sendDataToDatabase(symbol)
-                if db_data:
-                    print("\nData successfully prepared for database storage")
+        if choice == '1':
+            # Get exchange
+            print("\nSelect Exchange:")
+            print("1. NSE (National Stock Exchange)")
+            print("2. BSE (Bombay Stock Exchange)")
+            
+            exchange_map = {'1': 'NSE', '2': 'BSE'}
+            exchange_choice = input("\nEnter choice (1-2): ")
+            exchange = exchange_map.get(exchange_choice, 'NSE')
+            suffix = analyzer.exchange_suffixes[exchange]
+            
+            # Get stock symbols
+            symbols_input = input("\nEnter stock symbols (comma-separated, e.g., RELIANCE,TCS,HDFCBANK): ")
+            symbols = [s.strip().upper() + suffix for s in symbols_input.split(',') if s.strip()]
+            
+            # Validate symbols
+            valid_symbols = []
+            print("\nValidating symbols...")
+            for symbol in symbols:
+                if analyzer.validate_symbol(symbol):
+                    valid_symbols.append(symbol)
+                    print(f"✓ {symbol} is valid")
                 else:
-                    print("\nFailed to prepare data for database storage")
-                
-            except Exception as e:
-                print(f"\nError analyzing {symbol}: {str(e)}")
+                    print(f"✗ {symbol} is not valid")
+            
+            if not valid_symbols:
+                print("\nNo valid symbols found!")
+                if input("\nTry again? (y/n): ").lower() != 'y':
+                    break
+                continue
+            
+            # Get date range
+            start_date, end_date = get_date_range()
+            
+            # Fetch and analyze data
+            print(f"\nFetching data from {start_date} to {end_date}...")
+            
+            for symbol in valid_symbols:
+                try:
+                    # Get data
+                    data = analyzer.get_stock_data(symbol, start_date, end_date)
+                    if data.empty:
+                        print(f"\nNo data available for {symbol}")
+                        continue
+                    
+                    # Calculate statistics
+                    stats = analyzer.calculate_statistics(data, exchange)
+                    
+                    # Display results
+                    print(f"\n{'=' * 50}")
+                    print(f"Analysis for {symbol}")
+                    print(f"{'=' * 50}")
+                    print(f"Current Price: ₹{stats['current_price']}")
+                    print(f"Previous Close: ₹{stats['previous_close']}")
+                    print(f"\nToday's Trading:")
+                    print(f"Open: ₹{stats['open']}")
+                    print(f"High: ₹{stats['high']}")
+                    print(f"Low: ₹{stats['low']}")
+                    print(f"Volume: {stats['volume']:,}")
+                    print(f"\nPrevious Business Day ({stats['prev_date']}):")
+                    print(f"Open: ₹{stats['prev_open']}")
+                    print(f"High: ₹{stats['prev_high']}")
+                    print(f"Low: ₹{stats['prev_low']}")
+                    print(f"Close: ₹{stats['prev_close']}")
+                    print(f"Volume: {stats['prev_volume']:,}")
+                    print(f"\nPerformance:")
+                    print(f"Daily Return: {stats['daily_return']}%")
+                    print(f"Total Return: {stats['total_return']}%")
+                    print(f"Volatility: {stats['volatility']}%")
+                    print(f"\nPeriod Statistics ({start_date} to {end_date}):")
+                    print(f"Highest Price: ₹{stats['period_high']}")
+                    print(f"Lowest Price: ₹{stats['period_low']}")
+                    print(f"Average Daily Volume: {stats['avg_volume']:,}")
+                    
+                    # Display database-ready data
+                    print(f"\n{'=' * 50}")
+                    print(f"Database-Ready Data for {symbol}")
+                    print(f"{'=' * 50}")
+                    db_data = analyzer.sendDataToDatabase(symbol)
+                    if db_data:
+                        print("\nData successfully prepared for database storage")
+                    else:
+                        print("\nFailed to prepare data for database storage")
+                    
+                except Exception as e:
+                    print(f"\nError analyzing {symbol}: {str(e)}")
+            
+            print("\n" + "="*80)  # Add a separator between analyses
+            if input("\nAnalyze more stocks? (y/n): ").lower() != 'y':
+                break
         
-        print("\n" + "="*80)  # Add a separator between analyses
-        if input("\nAnalyze more stocks? (y/n): ").lower() != 'y':
+        elif choice == '2':
+            # Get stock name
+            stock_name = input("\nEnter stock name (e.g., RELIANCE): ").strip().upper()
+            
+            # Get date range
+            print("\nEnter date range for historical data:")
+            start_date = input("Start date (YYYY-MM-DD): ")
+            end_date = input("End date (YYYY-MM-DD) or press Enter for today: ")
+            
+            if not end_date:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Store historical data
+            success = analyzer.store_historical_data(stock_name, start_date, end_date)
+            if success:
+                print(f"\nSuccessfully stored historical data for {stock_name}")
+            else:
+                print(f"\nFailed to store historical data for {stock_name}")
+        
+        elif choice == '3':
             break
+        else:
+            print("\nInvalid choice! Please try again.")
     
     print("\nThank you for using the Stock Market Analysis Tool!")
 
