@@ -468,29 +468,142 @@ class StockAnalyzer:
             if conn:
                 conn.close()
 
-    def store_historical_data(self, stock_name: str, start_date: str, end_date: str) -> bool:
+    def get_stock_call_date_range(self, stock_name: str) -> tuple:
+        """
+        Get the date range for a stock call from stockCalls and stockCallActuals tables
+        
+        Args:
+            stock_name (str): Stock name (e.g., 'RELIANCE')
+            
+        Returns:
+            tuple: (start_date, end_date) in YYYY-MM-DD format, or (None, None) if not found
+        """
+        try:
+            conn = psycopg2.connect(**self.db_config)
+            with conn.cursor() as cur:
+                # First, get the most recent active stock call
+                cur.execute("""
+                    SELECT id, calldate, stockname
+                    FROM stockCalls
+                    WHERE stockname = %s 
+                    AND active = TRUE
+                    ORDER BY calldate DESC
+                    LIMIT 1
+                """, (stock_name,))
+                stock_call = cur.fetchone()
+                
+                if not stock_call:
+                    logger.error(f"No active stock call found for {stock_name}")
+                    return None, None
+                
+                stock_call_id, call_date, stock_name = stock_call
+                
+                if call_date is None:
+                    logger.error(f"No call date found for {stock_name}")
+                    return None, None
+                
+                # Now get the duration from stockCallActuals
+                cur.execute("""
+                    SELECT call_duration_in_days
+                    FROM stockCallActuals
+                    WHERE stock_call_id = %s
+                    AND active = TRUE
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (stock_call_id,))
+                duration_result = cur.fetchone()
+                
+                # If no duration found in stockCallActuals, use default duration
+                if not duration_result or duration_result[0] is None or duration_result[0] == 0:
+                    logger.info(f"No valid duration found for {stock_name} in stockCallActuals, using default duration of 30 days")
+                    duration = 30
+                else:
+                    duration = int(duration_result[0])
+                    logger.info(f"Found duration of {duration} days in stockCallActuals")
+                
+                # Calculate end date by adding duration days to call date
+                start_date = call_date
+                end_date = start_date + timedelta(days=duration)
+                
+                # Format dates as strings
+                start_date_str = start_date.strftime('%Y-%m-%d')
+                end_date_str = end_date.strftime('%Y-%m-%d')
+                
+                logger.info(f"Date range for {stock_name}:")
+                logger.info(f"Start date (Call Date): {start_date_str}")
+                logger.info(f"Duration: {duration} days")
+                logger.info(f"End date: {end_date_str}")
+                
+                return start_date_str, end_date_str
+                
+        except Exception as e:
+            logger.error(f"Error getting stock call date range: {str(e)}")
+            return None, None
+        finally:
+            if conn:
+                conn.close()
+
+    def store_historical_data(self, stock_name: str, start_date: str = None, end_date: str = None) -> bool:
         """
         Store historical stock data in stockCallActuals table for the given date range
         
         Args:
             stock_name (str): Stock name (e.g., 'RELIANCE')
-            start_date (str): Start date in YYYY-MM-DD format
-            end_date (str): End date in YYYY-MM-DD format
+            start_date (str, optional): Start date in YYYY-MM-DD format. If None, uses callDate from stockCalls
+            end_date (str, optional): End date in YYYY-MM-DD format. If None, uses current date
             
         Returns:
             bool: True if data was stored successfully, False otherwise
         """
         try:
+            # If dates are not provided, get them from the database
+            target_end_date = None
+            if start_date is None or end_date is None:
+                start_date, calculated_end_date = self.get_stock_call_date_range(stock_name)
+                if start_date is None or calculated_end_date is None:
+                    logger.error("Could not determine date range from database")
+                    return False
+                
+                # Store the target end date before potentially modifying it
+                target_end_date = calculated_end_date
+                
+                # Use current date as end date if calculated end date is in the future
+                today = datetime.now().date()
+                calculated_end_dt = datetime.strptime(calculated_end_date, '%Y-%m-%d').date()
+                end_date = today.strftime('%Y-%m-%d') if calculated_end_dt > today else calculated_end_date
+            
             # Validate dates
             start_dt = datetime.strptime(start_date, '%Y-%m-%d')
             end_dt = datetime.strptime(end_date, '%Y-%m-%d')
             today = datetime.now()
             
-            if start_dt > today or end_dt > today:
-                logger.error("Cannot fetch data for future dates")
+            if start_dt > today:
+                logger.error("Cannot fetch data for future start date")
                 return False
             
+            # If end date is in future, use today's date
+            if end_dt > today:
+                end_date = today.strftime('%Y-%m-%d')
+                end_dt = today
+            
+            # Calculate actual duration in days
+            duration_days = (end_dt.date() - start_dt.date()).days
+            
+            # Calculate remaining days using the target end date
+            if target_end_date:
+                target_end_dt = datetime.strptime(target_end_date, '%Y-%m-%d').date()
+                total_duration = (target_end_dt - start_dt.date()).days
+                remaining_days = (target_end_dt - today.date()).days if target_end_dt > today.date() else 0
+                logger.info(f"Target end date: {target_end_date}")
+                logger.info(f"Total duration: {total_duration} days")
+                logger.info(f"Remaining days: {remaining_days} days")
+            else:
+                # If no target end date (custom date range), use the provided end date
+                remaining_days = (end_dt.date() - today.date()).days if end_dt.date() > today.date() else 0
+                logger.info(f"Using provided end date: {end_date}")
+            
             logger.info(f"Attempting to store data for {stock_name} from {start_date} to {end_date}")
+            logger.info(f"Duration in days: {duration_days}")
             
             # Get stock_call_id first
             stock_call_id = self.get_stock_call_id(stock_name)
@@ -500,8 +613,41 @@ class StockAnalyzer:
             
             logger.info(f"Found stock_call_id: {stock_call_id}")
             
+            # Update call_duration_in_days in stockCallActuals with remaining days
+            try:
+                conn = psycopg2.connect(**self.db_config)
+                with conn.cursor() as cur:
+                    # Update call_duration_in_days for all records of this stock call
+                    cur.execute("""
+                        UPDATE stockCallActuals 
+                        SET call_duration_in_days = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE stock_call_id = %s
+                        AND record_date >= %s
+                    """, (remaining_days, stock_call_id, start_date))
+                    conn.commit()
+                    logger.info(f"Updated call_duration_in_days to {remaining_days} (remaining days) for stock_call_id {stock_call_id}")
+            except Exception as e:
+                logger.error(f"Error updating call_duration_in_days: {str(e)}")
+                if conn:
+                    conn.rollback()
+            finally:
+                if conn:
+                    conn.close()
+            
             # Add exchange suffix to stock name for fetching data
             symbol = f"{stock_name}.NS"  # Default to NSE
+            
+            # Get market calendar for business days
+            calendar = self.nse_calendar
+            schedule = calendar.schedule(start_date=start_dt.date(), end_date=end_dt.date())
+            
+            if schedule.empty:
+                logger.error(f"No trading days found between {start_date} and {end_date}")
+                return False
+            
+            # Get list of business days
+            business_days = set(schedule.index.date)  # Convert to set for faster lookups
             
             # Fetch historical data
             logger.info("Fetching stock data...")
@@ -510,13 +656,28 @@ class StockAnalyzer:
                 logger.error(f"No data available for {stock_name} between {start_date} and {end_date}")
                 return False
             
+            # Filter data to only include business days
+            business_day_data = []
+            for date, row in data.iterrows():
+                if date.date() in business_days:
+                    business_day_data.append((date, row))
+            
+            if not business_day_data:
+                logger.error(f"No business day data available for {stock_name} between {start_date} and {end_date}")
+                return False
+            
             # Prepare data for database insertion
             records = []
-            for date, row in data.iterrows():
+            for date, row in business_day_data:
                 # Calculate hit_or_miss based on your business logic
-                # This is a placeholder - you'll need to implement your actual logic
                 hit_or_miss = 'HIT'  # or 'MISS' based on your criteria
                 hit_or_miss_reason = None  # Add your reason if needed
+                
+                # Calculate remaining days for this specific record
+                if target_end_date:
+                    record_remaining_days = (target_end_dt - date.date()).days if target_end_dt > date.date() else 0
+                else:
+                    record_remaining_days = remaining_days
                 
                 record = (
                     stock_call_id,
@@ -529,41 +690,22 @@ class StockAnalyzer:
                     hit_or_miss_reason,
                     True,  # active
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # created_at
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')   # updated_at
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # updated_at
+                    record_remaining_days  # Store remaining days for this specific record
                 )
                 records.append(record)
             
-            logger.info(f"Preparing to store {len(records)} records in database...")
+            logger.info(f"Preparing to store {len(records)} business day records in database...")
 
             # Connect to database and insert data
             try:
                 conn = psycopg2.connect(**self.db_config)
                 with conn.cursor() as cur:
-                    # First, check the actual table structure
-                    cur.execute("""
-                        SELECT column_name 
-                        FROM information_schema.columns 
-                        WHERE table_name = 'stockCallActuals'
-                        ORDER BY ordinal_position
-                    """)
-                    columns = [col[0] for col in cur.fetchall()]
-                    logger.info(f"Table columns: {columns}")
-                    
-                    # Check if unique constraint exists
-                    cur.execute("""
-                        SELECT conname, pg_get_constraintdef(oid) 
-                        FROM pg_constraint 
-                        WHERE conrelid = 'stockCallActuals'::regclass 
-                        AND contype = 'u'
-                    """)
-                    constraints = cur.fetchall()
-                    logger.info(f"Unique constraints: {constraints}")
-                    
                     # Use execute_values for efficient bulk insertion
                     execute_values(cur, """
                         INSERT INTO stockCallActuals 
                         (stock_call_id, open_price, close_price, high_price, low_price, 
-                        record_date, hit_or_miss, hit_or_miss_reason, active, created_at, updated_at)
+                        record_date, hit_or_miss, hit_or_miss_reason, active, created_at, updated_at, call_duration_in_days)
                         VALUES %s
                         ON CONFLICT (stock_call_id, record_date) 
                         DO UPDATE SET
@@ -574,11 +716,12 @@ class StockAnalyzer:
                             hit_or_miss = EXCLUDED.hit_or_miss,
                             hit_or_miss_reason = EXCLUDED.hit_or_miss_reason,
                             active = EXCLUDED.active,
-                            updated_at = EXCLUDED.updated_at
+                            updated_at = EXCLUDED.updated_at,
+                            call_duration_in_days = EXCLUDED.call_duration_in_days
                     """, records)
                 
                 conn.commit()
-                logger.info(f"Successfully stored {len(records)} records for {stock_name}")
+                logger.info(f"Successfully stored {len(records)} business day records for {stock_name}")
                 return True
 
             except Exception as e:
@@ -744,16 +887,24 @@ def main():
             # Get stock name
             stock_name = input("\nEnter stock name (e.g., RELIANCE): ").strip().upper()
             
-            # Get date range
-            print("\nEnter date range for historical data:")
-            start_date = input("Start date (YYYY-MM-DD): ")
-            end_date = input("End date (YYYY-MM-DD) or press Enter for today: ")
+            # Ask if user wants to use custom date range
+            use_custom_dates = input("\nUse custom date range? (y/n): ").lower() == 'y'
             
-            if not end_date:
-                end_date = datetime.now().strftime('%Y-%m-%d')
+            if use_custom_dates:
+                # Get custom date range
+                print("\nEnter date range for historical data:")
+                start_date = input("Start date (YYYY-MM-DD): ")
+                end_date = input("End date (YYYY-MM-DD) or press Enter for today: ")
+                
+                if not end_date:
+                    end_date = datetime.now().strftime('%Y-%m-%d')
+                
+                # Store historical data with custom dates
+                success = analyzer.store_historical_data(stock_name, start_date, end_date)
+            else:
+                # Store historical data using dates from database
+                success = analyzer.store_historical_data(stock_name)
             
-            # Store historical data
-            success = analyzer.store_historical_data(stock_name, start_date, end_date)
             if success:
                 print(f"\nSuccessfully stored historical data for {stock_name}")
             else:
